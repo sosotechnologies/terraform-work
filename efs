@@ -1,0 +1,191 @@
+## 1. Create an IAM OIDC provider for your cluster 
+https://docs.aws.amazon.com/eks/latest/userguide/iam-roles-for-service-accounts.html#iam-roles-for-service-accounts.title
+
+```sh
+cluster_name=IWordee-Production-sosotechboss
+
+oidc_id=$(aws eks describe-cluster --name $cluster_name --query "cluster.identity.oidc.issuer" --output text | cut -d '/' -f 5)
+
+echo $oidc_id
+# Determine whether an IAM OIDC provider with your cluster's issuer ID is already in your account.
+aws iam list-open-id-connect-providers | grep $oidc_id | cut -d "/" -f4
+```
+
+## 2. Create the IAM Role for the EFS CSI Driver
+
+Create a Trust Policy File: Create a trust policy file trust-policy.json that allows the EKS service account to assume the IAM role:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::368085106192:oidc-provider/oidc.eks.us-east-1.amazonaws.com/id/IWordee-Production-sosotechboss"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "oidc.eks.<region>.amazonaws.com/id/IWordee-Production-sosotechboss:sub": "system:serviceaccount:kube-system:efs-csi-controller-sa"
+
+        }
+      }
+    }
+  ]
+}
+```
+
+Create the IAM role and attach the trust policy:
+
+```sh
+aws iam create-role --role-name EFSCSIDriverRole --assume-role-policy-document file://trust-policy.json
+```
+
+## 3. Create and Attach the Permissions Policy
+This policy specifies what actions the role is allowed to perform within AWS.
+The AmazonEFSCSIDriverPolicy you tried to attach is a permissions policy that grants the role the ability to manage EFS resources.
+Since you encountered an error stating that AmazonEFSCSIDriverPolicy doesn't exist, I suggested creating a custom permissions policy (efs-csi-driver-policy.json) that grants similar permissions.
+
+```json
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "elasticfilesystem:DescribeAccessPoints",
+                "elasticfilesystem:DescribeFileSystems",
+                "elasticfilesystem:CreateAccessPoint",
+                "elasticfilesystem:DeleteAccessPoint",
+                "elasticfilesystem:DescribeMountTargets",
+                "ec2:DescribeSubnets",
+                "ec2:DescribeInstances",
+                "ec2:DescribeNetworkInterfaces",
+                "ec2:CreateNetworkInterface",
+                "ec2:DeleteNetworkInterface",
+                "ec2:DescribeSecurityGroups",
+                "ec2:ModifyNetworkInterfaceAttribute",
+                "ec2:DescribeAvailabilityZones"
+            ],
+            "Resource": "*"
+        }
+    ]
+}
+```
+
+### 1. Create the policy in IAM:
+
+```sh
+aws iam create-policy --policy-name CustomEFSCSIDriverPolicy --policy-document file://efs-csi-driver-policy.json
+```
+
+### 2. Attach the permissions policy to your IAM role:
+
+```sh
+aws iam attach-role-policy --role-name EFSCSIDriverRole --policy-arn arn:aws:iam::368085106192:policy/CustomEFSCSIDriverPolicy
+```
+
+## 4. Install the EFS CSI Driver on Your EKS Cluster
+```sh
+helm repo add aws-efs-csi-driver https://kubernetes-sigs.github.io/aws-efs-csi-driver/
+helm repo update
+helm install aws-efs-csi-driver aws-efs-csi-driver/aws-efs-csi-driver \
+  --namespace kube-system \
+  --set serviceAccount.controller.create=false \
+  --set serviceAccount.controller.name=efs-csi-controller-sa \
+  --set controller.serviceAccount.create=false \
+  --set controller.serviceAccount.name=efs-csi-controller-sa \
+  --set controller.serviceAccount.annotations."eks\.amazonaws\.com/role-arn"="arn:aws:iam::368085106192:role/EFSCSIDriverRole"
+```
+
+### Verify that the drivers have been installed
+
+```sh
+kubectl get pods -n kube-system -l app.kubernetes.io/name=aws-efs-csi-driver
+```
+
+## 5 N Create an EFS File System
+### Step 1: Create an EFS File System via CLI
+```sh
+aws efs create-file-system \
+    --creation-token MyEFSFileSystem \
+    --performance-mode generalPurpose \
+    --throughput-mode bursting
+```
+
+### Step 2: Create an EFS Access Point via CLI (Optional)
+
+```sh
+aws efs create-access-point \
+    --file-system-id fs-06242e35e00f2dc72 \
+    --posix-user Uid=1001,Gid=1001 \
+    --root-directory 'Path=/,CreationInfo={OwnerUid=1001,OwnerGid=1001,Permissions=755}' \
+    --tags Key=Name,Value=MyEFSAccessPoint
+```
+
+### Step 3:  setup Dynamic Provisioning with EFS CSI Driver
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: efs-sc
+provisioner: efs.csi.aws.com
+parameters:
+  provisioningMode: efs-ap
+  fileSystemId: fs-06242e35e00f2dc72  # Use your actual FileSystemId
+  directoryPerms: "700"
+  gidRangeStart: "1000"
+  gidRangeEnd: "2000"
+  uid: "1001"
+  rootDirectory: "/"
+  accessPointId: fsap-0a0481ab67b113626  # Use your actual AccessPointId
+mountOptions:
+  - tls
+reclaimPolicy: Retain
+```
+
+### Step 4: Create a Persistent Volume Claim (PVC)
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: efs-dynamic-pvc
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: efs-sc
+  resources:
+    requests:
+      storage: 5Gi
+```
+
+### Step 5: Use the PVC in a Pod
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: efs-dynamic-app
+spec:
+  containers:
+  - name: app
+    image: nginx
+    volumeMounts:
+    - name: efs-volume
+      mountPath: /usr/share/nginx/html
+  volumes:
+  - name: efs-volume
+    persistentVolumeClaim:
+      claimName: efs-dynamic-pvc
+```
+
+
+
+
+
+helm status aws-efs-csi-driver -n kube-system
+kubectl get serviceaccount efs-csi-controller-sa -n kube-system
+
+efs-csi-node-sa                     
